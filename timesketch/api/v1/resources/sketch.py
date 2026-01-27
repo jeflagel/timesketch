@@ -596,16 +596,16 @@ class SketchResource(resources.ResourceMixin, Resource):
                 logger.debug("Force delete not present, will keep the OS data.")
 
         # Check if user has admin privileges for force deletion
+        # This must happen BEFORE any modifications to the sketch
         if force_delete:
-            if current_user.admin:
-                logger.debug(
-                    "User: %s is going to delete sketch %s", current_user, sketch_id
-                )
-            else:
+            if not current_user.admin:
                 abort(
                     HTTP_STATUS_CODE_FORBIDDEN,
                     "Sketch cannot be deleted. User is not an admin",
                 )
+            logger.debug(
+                "User: %s is going to delete sketch %s", current_user, sketch_id
+            )
 
         # Check if any timeline is still processing
         is_any_timeline_processing = any(
@@ -617,79 +617,113 @@ class SketchResource(resources.ResourceMixin, Resource):
                 "Cannot delete sketch: one or more timelines are still processing.",
             )
 
-        sketch.set_status(status="deleted")
-
-        # Default behaviour for historical reasons: exit with 200 without
-        # deleting
+        # SOFT DELETE: Mark as deleted and return immediately
+        # Do NOT proceed with OpenSearch deletion
         if not force_delete:
+            sketch.set_status(status="deleted")
+            db_session.commit()
+            logger.info(
+                "Sketch %s soft deleted by user %s (marked as deleted, data preserved)",
+                sketch_id,
+                current_user,
+            )
             return HTTP_STATUS_CODE_OK
 
-        # now the real deletion
+        # HARD DELETE: Delete OpenSearch indices FIRST, THEN delete from DB
+        # Do NOT mark sketch as deleted until everything succeeds
+        deleted_indices = []
+        failed_indices = []
+
         for timeline in sketch.timelines:
             timeline.set_status(status="deleted")
             searchindex = timeline.searchindex
-            # remove the opensearch index
             index_name_to_delete = searchindex.index_name
 
             try:
                 # Attempt to delete the OpenSearch index
                 self.datastore.client.indices.delete(index=index_name_to_delete)
-                logger.debug(
-                    "User: %s is going to delete OS index %s",
+                logger.info(
+                    "User: %s deleted OpenSearch index %s",
                     current_user,
                     index_name_to_delete,
                 )
 
-                # Check if the index is really deleted
+                # Verify the index is really deleted
                 if self.datastore.client.indices.exists(index=index_name_to_delete):
-                    e_msg = (
-                        f"Failed to delete OpenSearch index "
-                        f"{index_name_to_delete}. Please check logs."
+                    failed_indices.append(index_name_to_delete)
+                    logger.error(
+                        "OpenSearch index %s still exists after deletion attempt",
+                        index_name_to_delete,
                     )
-                    logger.error(e_msg)
-                    abort(HTTP_STATUS_CODE_INTERNAL_SERVER_ERROR, e_msg)
                 else:
+                    deleted_indices.append(index_name_to_delete)
                     logger.debug(
                         "OpenSearch index %s successfully deleted.",
                         index_name_to_delete,
                     )
 
             except NotFoundError:
-                # This can happen if the index was already deleted or never existed.
-                e_msg = (
-                    f"OpenSearch index {index_name_to_delete} was not found "
-                    f"during deletion attempt. It might have been deleted "
-                    f"already."
+                # Index was already deleted or never existed
+                logger.warning(
+                    "OpenSearch index %s was not found during deletion. "
+                    "It might have been deleted already.",
+                    index_name_to_delete,
                 )
-                logger.warning(e_msg)
+                deleted_indices.append(index_name_to_delete)
+
             except ConnectionError as e:
-                e_msg = (
-                    f"Connection error while trying to delete OpenSearch index "
-                    f"{index_name_to_delete}:\n"
-                    f"{e}"
-                )
-                logger.error(e_msg)
-                abort(
-                    HTTP_STATUS_CODE_INTERNAL_SERVER_ERROR,
-                    e_msg,
-                )
-            except Exception as e:  # pylint: disable=broad-except
-                # Catch any other unexpected errors during deletion
-                e_msg = (
-                    f"An unexpected error occurred while deleting "
-                    f"OpenSearch index {index_name_to_delete}: {e}"
-                )
-                logger.error(e_msg)
-                abort(
-                    HTTP_STATUS_CODE_INTERNAL_SERVER_ERROR,
-                    e_msg,
+                failed_indices.append(index_name_to_delete)
+                logger.error(
+                    "Connection error while deleting OpenSearch index %s: %s",
+                    index_name_to_delete,
+                    str(e),
                 )
 
-            db_session.delete(searchindex)
+            except Exception as e:  # pylint: disable=broad-except
+                failed_indices.append(index_name_to_delete)
+                logger.error(
+                    "Unexpected error while deleting OpenSearch index %s: %s",
+                    index_name_to_delete,
+                    str(e),
+                )
+
+        # If any index deletion failed, abort WITHOUT deleting from database
+        if failed_indices:
+            abort(
+                HTTP_STATUS_CODE_INTERNAL_SERVER_ERROR,
+                f"Failed to delete OpenSearch indices: {', '.join(failed_indices)}. "
+                f"Sketch {sketch_id} has not been removed from database. "
+                f"Please check logs for details.",
+            )
+
+        # All OpenSearch indices deleted successfully
+        # Now delete database objects in the correct order to respect foreign keys
+        # Order matters: timeline -> searchindex -> sketch
+        for timeline in sketch.timelines:
+            searchindex = timeline.searchindex
+
+            # Delete timeline first (it references searchindex via FK)
             db_session.delete(timeline)
 
+            # Then delete searchindex (now safe because timeline is deleted)
+            db_session.delete(searchindex)
+
+        # Finally mark sketch as deleted and remove it from DB
+        sketch.set_status(status="deleted")
         db_session.delete(sketch)
+
+        # Commit everything in a single transaction
+        # If this fails, everything will be rolled back automatically
         db_session.commit()
+
+        logger.info(
+            "Sketch %s successfully hard deleted by user %s. "
+            "Deleted OpenSearch indices: %s",
+            sketch_id,
+            current_user,
+            ', '.join(deleted_indices) if deleted_indices else 'none'
+        )
+
         return HTTP_STATUS_CODE_OK
 
     @login_required
